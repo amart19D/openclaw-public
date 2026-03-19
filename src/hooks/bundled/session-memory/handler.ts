@@ -23,7 +23,7 @@ import {
 import { resolveUserTimezone } from "../../../agents/date-time.js";
 import type { OpenClawConfig } from "../../../config/config.js";
 import { resolveStateDir } from "../../../config/paths.js";
-import { writeFileWithinRoot } from "../../../infra/fs-safe.js";
+import { appendFileWithinRoot, writeFileWithinRoot } from "../../../infra/fs-safe.js";
 import { createSubsystemLogger } from "../../../logging/subsystem.js";
 import {
   parseAgentSessionKey,
@@ -204,24 +204,42 @@ async function findPreviousSessionFile(params: {
 }
 
 /**
- * Resolve the date string using the user's configured timezone.
- * Falls back to UTC if no timezone is configured.
+ * Resolve date and time strings using the user's configured timezone.
+ * Falls back to UTC if no timezone is configured. Returns both the date
+ * (YYYY-MM-DD) and time (HH:MM:SS) in the same timezone for consistency.
  */
-function resolveDateStrInUserTimezone(timestamp: number, cfg?: OpenClawConfig): string {
+function resolveUserDateAndTime(
+  timestamp: number,
+  cfg?: OpenClawConfig,
+): { dateStr: string; timeStr: string; timezone: string } {
   const timezone = resolveUserTimezone(cfg?.agents?.defaults?.userTimezone);
-  const parts = new Intl.DateTimeFormat("en-US", {
+  const date = new Date(timestamp);
+
+  const dateParts = new Intl.DateTimeFormat("en-US", {
     timeZone: timezone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).formatToParts(new Date(timestamp));
-  const year = parts.find((part) => part.type === "year")?.value;
-  const month = parts.find((part) => part.type === "month")?.value;
-  const day = parts.find((part) => part.type === "day")?.value;
-  if (year && month && day) {
-    return `${year}-${month}-${day}`;
-  }
-  return new Date(timestamp).toISOString().slice(0, 10);
+  }).formatToParts(date);
+  const year = dateParts.find((part) => part.type === "year")?.value;
+  const month = dateParts.find((part) => part.type === "month")?.value;
+  const day = dateParts.find((part) => part.type === "day")?.value;
+  const dateStr =
+    year && month && day ? `${year}-${month}-${day}` : date.toISOString().slice(0, 10);
+
+  const timeParts = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const hour = timeParts.find((part) => part.type === "hour")?.value ?? "00";
+  const minute = timeParts.find((part) => part.type === "minute")?.value ?? "00";
+  const second = timeParts.find((part) => part.type === "second")?.value ?? "00";
+  const timeStr = `${hour}:${minute}:${second}`;
+
+  return { dateStr, timeStr, timezone };
 }
 
 /**
@@ -257,8 +275,8 @@ const saveSessionToMemory: HookHandler = async (event) => {
     const memoryDir = path.join(workspaceDir, "memory");
     await fs.mkdir(memoryDir, { recursive: true });
 
-    // Use user timezone for date, falling back to UTC
-    const dateStr = resolveDateStrInUserTimezone(event.timestamp, cfg);
+    // Use user timezone for both date and time (consistent timezone in header)
+    const { dateStr, timeStr, timezone } = resolveUserDateAndTime(event.timestamp, cfg);
 
     // Generate descriptive slug from session using LLM
     // Prefer previousSessionEntry (old session before /new) over current (which may be empty)
@@ -353,9 +371,6 @@ const saveSessionToMemory: HookHandler = async (event) => {
       path: memoryFilePath.replace(os.homedir(), "~"),
     });
 
-    // Format time as HH:MM:SS UTC
-    const timeStr = new Date(event.timestamp).toISOString().split("T")[1].split(".")[0];
-
     // Extract context details
     const sessionId = (sessionEntry.sessionId as string) || "unknown";
     const source = (context.commandSource as string) || "unknown";
@@ -364,6 +379,7 @@ const saveSessionToMemory: HookHandler = async (event) => {
     // it into a concise summary. Falls back to raw content on failure.
     const synthesisEnabled = hookConfig?.synthesis === true;
     let outputContent = sessionContent;
+    let synthesisSucceeded = false;
 
     if (synthesisEnabled && sessionContent && cfg) {
       const isTestEnv =
@@ -381,6 +397,7 @@ const saveSessionToMemory: HookHandler = async (event) => {
         });
         if (synthesized) {
           outputContent = synthesized;
+          synthesisSucceeded = true;
           log.debug("Synthesis complete", { length: synthesized.length });
         } else {
           log.debug("Synthesis returned empty or failed, using raw content");
@@ -388,9 +405,10 @@ const saveSessionToMemory: HookHandler = async (event) => {
       }
     }
 
-    // Build Markdown entry
+    // Build Markdown entry — date and time use the same timezone
+    const timezoneLabel = timezone === "UTC" ? "UTC" : timezone;
     const entryParts = [
-      `# Session: ${dateStr} ${timeStr} UTC`,
+      `# Session: ${dateStr} ${timeStr} (${timezoneLabel})`,
       "",
       `- **Session Key**: ${displaySessionKey}`,
       `- **Session ID**: ${sessionId}`,
@@ -400,7 +418,7 @@ const saveSessionToMemory: HookHandler = async (event) => {
 
     // Include conversation content if available
     if (outputContent) {
-      if (synthesisEnabled && outputContent !== sessionContent) {
+      if (synthesisEnabled && synthesisSucceeded) {
         entryParts.push("## Summary", "", outputContent, "");
       } else {
         entryParts.push("## Conversation Summary", "", outputContent, "");
@@ -420,26 +438,16 @@ const saveSessionToMemory: HookHandler = async (event) => {
 
     // Also append to canonical daily file (memory/YYYY-MM-DD.md) so the boot
     // sequence can find session memories without relying on memory_search.
+    // Uses atomic appendFileWithinRoot to avoid TOCTOU races when multiple
+    // /new commands fire in rapid succession on the same day.
     const canonicalFilename = `${dateStr}.md`;
-    const canonicalPath = path.join(memoryDir, canonicalFilename);
     try {
-      const separator = "\n---\n\n";
-      let existingContent = "";
-      try {
-        existingContent = await fs.readFile(canonicalPath, "utf-8");
-      } catch {
-        // File doesn't exist yet — will be created.
-      }
-
-      const appendContent = existingContent
-        ? `${existingContent.trimEnd()}${separator}${entry}`
-        : entry;
-
-      await writeFileWithinRoot({
+      await appendFileWithinRoot({
         rootDir: memoryDir,
         relativePath: canonicalFilename,
-        data: appendContent,
+        data: `\n---\n\n${entry}`,
         encoding: "utf-8",
+        prependNewlineIfNeeded: false,
       });
       log.debug("Appended to canonical daily file", { canonicalFilename });
     } catch (err) {

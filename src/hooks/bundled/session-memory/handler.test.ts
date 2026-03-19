@@ -602,10 +602,11 @@ describe("session-memory hook", () => {
     const memoryDir = path.join(tempDir, "memory");
     const files = await fs.readdir(memoryDir);
 
-    // Should have at least 2 files: the slug file and the canonical daily file
-    const dateStr = new Date().toISOString().split("T")[0];
-    const canonicalFile = files.find((f) => f === `${dateStr}.md`);
-    const slugFile = files.find((f) => f !== `${dateStr}.md` && f.endsWith(".md"));
+    // Find canonical file (YYYY-MM-DD.md — no slug suffix) and slug file
+    const canonicalFile = files.find((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f));
+    const slugFile = files.find(
+      (f) => f.endsWith(".md") && f !== canonicalFile && /^\d{4}-\d{2}-\d{2}-.+\.md$/.test(f),
+    );
 
     expect(canonicalFile).toBeDefined();
     expect(slugFile).toBeDefined();
@@ -657,10 +658,13 @@ describe("session-memory hook", () => {
       previousSessionEntry: { sessionId: "session-2", sessionFile: sessionFile2 },
     });
 
-    // Check canonical file has both sessions separated
+    // Check canonical file has both sessions separated — find by pattern,
+    // not by constructing the date (which could differ from handler's timezone)
     const memoryDir = path.join(tempDir, "memory");
-    const dateStr = new Date().toISOString().split("T")[0];
-    const canonicalContent = await fs.readFile(path.join(memoryDir, `${dateStr}.md`), "utf-8");
+    const allFiles = await fs.readdir(memoryDir);
+    const canonFile = allFiles.find((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f));
+    expect(canonFile).toBeDefined();
+    const canonicalContent = await fs.readFile(path.join(memoryDir, canonFile!), "utf-8");
 
     expect(canonicalContent).toContain("First session content");
     expect(canonicalContent).toContain("Second session content");
