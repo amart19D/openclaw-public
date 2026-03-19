@@ -209,11 +209,11 @@ async function findPreviousSessionFile(params: {
  * (YYYY-MM-DD) and time (HH:MM:SS) in the same timezone for consistency.
  */
 function resolveUserDateAndTime(
-  timestamp: number,
+  timestamp: Date | number,
   cfg?: OpenClawConfig,
 ): { dateStr: string; timeStr: string; timezone: string } {
   const timezone = resolveUserTimezone(cfg?.agents?.defaults?.userTimezone);
-  const date = new Date(timestamp);
+  const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
 
   const dateParts = new Intl.DateTimeFormat("en-US", {
     timeZone: timezone,
